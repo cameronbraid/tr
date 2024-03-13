@@ -68,7 +68,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //!   `gettext::Catalog` object
 //!
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 #[doc(hidden)]
 pub mod runtime_format {
@@ -493,6 +493,29 @@ macro_rules! with_translator {
 
 #[cfg(feature = "gettext")]
 impl Translator for gettext::Catalog {
+    fn translate<'a>(&'a self, string: &'a str, context: Option<&'a str>) -> Cow<'a, str> {
+        Cow::Borrowed(if let Some(ctx) = context {
+            self.pgettext(ctx, string)
+        } else {
+            self.gettext(string)
+        })
+    }
+    fn ntranslate<'a>(
+        &'a self,
+        n: u64,
+        singular: &'a str,
+        plural: &'a str,
+        context: Option<&'a str>,
+    ) -> Cow<'a, str> {
+        Cow::Borrowed(if let Some(ctx) = context {
+            self.npgettext(ctx, singular, plural, n)
+        } else {
+            self.ngettext(singular, plural, n)
+        })
+    }
+}
+#[cfg(feature = "gettext")]
+impl Translator for Arc<gettext::Catalog> {
     fn translate<'a>(&'a self, string: &'a str, context: Option<&'a str>) -> Cow<'a, str> {
         Cow::Borrowed(if let Some(ctx) = context {
             self.pgettext(ctx, string)
