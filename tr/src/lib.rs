@@ -64,7 +64,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //!
 //! - **`gettext-rs`** *(enabled by default)* - This crate wraps the gettext C library
 //! - **`gettext`** - A rust re-implementation of gettext. That crate does not take care of loading the
-//!   right .mo files, so one must use the (`set_translator!`)[macro.set_translator.html] macro with a
+//!   right .mo files, so one must use the (`c!`)[macro.with_translator.html] macro with a
 //!   `gettext::Catalog` object
 //!
 
@@ -241,7 +241,7 @@ pub mod runtime_format {
 /// The backend is only responsable to provide a matching string, the formatting is done
 /// using this string.
 ///
-/// The translator for a crate can be set with the set_translator! macro
+/// The translator for a crate can be set with the with_translator! macro
 pub trait Translator: Send + Sync {
     fn translate<'a>(&'a self, string: &'a str, context: Option<&'a str>) -> Cow<'a, str>;
     fn ntranslate<'a>(
@@ -257,25 +257,19 @@ pub trait Translator: Send + Sync {
 pub mod internal {
 
     use super::Translator;
-    use std::{borrow::Cow, collections::HashMap, sync::RwLock};
+    use std::{borrow::Cow, sync::Arc};
 
-    // TODO: use parking_lot::RwLock
-    lazy_static::lazy_static! {
-        static ref TRANSLATORS: RwLock<HashMap<&'static str, Box<dyn Translator>>> =
-            Default::default();
+    tokio::task_local! {
+        static TRANSLATORS: Arc<dyn Translator>;
     }
 
-    pub fn with_translator<T>(module: &'static str, func: impl FnOnce(&dyn Translator) -> T) -> T {
-        let domain = domain_from_module(module);
-        let def = DefaultTranslator(domain);
-        func(
-            TRANSLATORS
-                .read()
-                .unwrap()
-                .get(domain)
-                .map(|x| &**x)
-                .unwrap_or(&def),
-        )
+    pub fn do_translator<T>(module: &'static str, func: impl Fn(&dyn Translator) -> T) -> T {
+        match TRANSLATORS.try_with(|t| {
+            func(t.as_ref())
+        }) {
+            Ok(r) => r,
+            Err(_) => func(&DefaultTranslator(domain_from_module(module))),
+        }
     }
 
     fn domain_from_module(module: &str) -> &str {
@@ -357,11 +351,13 @@ pub mod internal {
         });
     }
 
-    pub fn set_translator(module: &'static str, translator: impl Translator + 'static) {
-        TRANSLATORS
-            .write()
-            .unwrap()
-            .insert(module, Box::new(translator));
+    pub async fn with_translator<Fut>(
+        translator: impl Translator + 'static,
+        func: impl FnOnce() -> Fut,
+    )
+    where Fut: std::future::Future<Output = ()>
+     {
+        TRANSLATORS.scope(Arc::new(translator), func()).await
     }
 }
 
@@ -421,43 +417,43 @@ pub mod internal {
 #[macro_export]
 macro_rules! tr {
     ($msgid:tt, $($tail:tt)* ) => {
-        $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+        $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.translate($msgid, None), $($tail)*))
     };
     ($msgid:tt) => {
-        $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+        $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.translate($msgid, None)))
     };
 
     ($msgctx:tt => $msgid:tt, $($tail:tt)* ) => {
-         $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+         $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.translate($msgid, Some($msgctx)), $($tail)*))
     };
     ($msgctx:tt => $msgid:tt) => {
-        $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+        $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.translate($msgid, Some($msgctx))))
     };
 
     ($msgid:tt | $plur:tt % $n:expr, $($tail:tt)* ) => {{
         let n = $n;
-        $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+        $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.ntranslate(n as u64, $msgid, $plur, None), $($tail)*, n=n))
     }};
     ($msgid:tt | $plur:tt % $n:expr) => {{
         let n = $n;
-        $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+        $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.ntranslate(n as u64, $msgid, $plur, None), n))
 
     }};
 
     ($msgctx:tt => $msgid:tt | $plur:tt % $n:expr, $($tail:tt)* ) => {{
          let n = $n;
-         $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+         $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.ntranslate(n as u64, $msgid, $plur, Some($msgctx)), $($tail)*, n=n))
     }};
     ($msgctx:tt => $msgid:tt | $plur:tt % $n:expr) => {{
          let n = $n;
-         $crate::internal::with_translator(module_path!(), |t| $crate::runtime_format!(
+         $crate::internal::do_translator(module_path!(), |t| $crate::runtime_format!(
             t.ntranslate(n as u64, $msgid, $plur, Some($msgctx)), n))
     }};
 }
@@ -467,7 +463,7 @@ macro_rules! tr {
 /// The macro should be called to specify the path in which the .mo files can be looked for.
 /// The argument is the string passed to bindtextdomain
 ///
-/// The alternative is to call the set_translator! macro
+/// The alternative is to call the with_translator! macro
 ///
 /// This macro is available only if the feature "gettext-rs" is enabled
 #[cfg(feature = "gettext-rs")]
@@ -486,12 +482,12 @@ macro_rules! tr_init {
 /// ```ignore
 /// let f = File::open("french.mo").expect("could not open the catalog");
 /// let catalog = Catalog::parse(f).expect("could not parse the catalog");
-/// set_translator!(catalog);
+/// with_translator!(catalog, || async { ... } );
 /// ```
 #[macro_export]
-macro_rules! set_translator {
-    ($translator:expr) => {
-        $crate::internal::set_translator(module_path!(), $translator)
+macro_rules! with_translator {
+    ($translator:expr, || async $body:expr) => {
+        $crate::internal::with_translator($translator, || async { $body }).await
     };
 }
 
@@ -522,7 +518,7 @@ impl Translator for gettext::Catalog {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn it_works() {
+    fn uses_default_translator() {
         assert_eq!(tr!("Hello"), "Hello");
         assert_eq!(tr!("ctx" => "Hello"), "Hello");
         assert_eq!(tr!("Hello {}", "world"), "Hello world");
@@ -545,4 +541,17 @@ mod tests {
             "I have 42 items"
         );
     }
+
+    #[tokio::test]
+    #[cfg(feature = "gettext")]
+    async fn uses_custom_translator() {
+      let mut catalog = gettext::Catalog::empty();
+      catalog.insert(gettext::Message::new("Hello", None, vec!["Bonjour"]));
+
+      with_translator!(catalog, || async {
+          eprintln!("{}", tr!("Hello {}", "world"));
+          assert_eq!(tr!("Hello"), "Bonjour");
+      });
+  }
+
 }
