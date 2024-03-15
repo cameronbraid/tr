@@ -351,13 +351,24 @@ pub mod internal {
         });
     }
 
-    pub async fn with_translator<Fut>(
+    pub async fn with_translator_future<F>(
         translator: impl Translator + 'static,
-        fut: Fut,
-    )
-    where Fut: std::future::Future<Output = ()>
-     {
+        fut: F,
+    ) -> F::Output
+    where F : std::future::Future
+    {
         TRANSLATORS.scope(Arc::new(translator), fut).await
+    }
+
+    pub async fn with_translator<F, Fut>(
+      translator: impl Translator + 'static,
+      f: F,
+    ) -> Fut::Output
+    where 
+      F: FnOnce() -> Fut,
+      Fut: std::future::Future,
+    {
+        TRANSLATORS.scope(Arc::new(translator), f()).await
     }
 }
 
@@ -488,14 +499,11 @@ macro_rules! tr_init {
 macro_rules! with_translator {
   ($translator:expr, || async $body:expr) => {
     {
-      async fn func() {
-        $body
-      };
-      $crate::internal::with_translator($translator, func()).await
+      $crate::internal::with_translator($translator, || async { $body }).await
     }
   };
   ($translator:expr, $fut:expr) => {
-      $crate::internal::with_translator($translator, $fut).await
+      $crate::internal::with_translator_future($translator, $fut).await
   };
 }
 
@@ -579,16 +587,21 @@ mod tests {
       let mut catalog = gettext::Catalog::empty();
       catalog.insert(gettext::Message::new("Hello", None, vec!["Bonjour"]));
 
+
       // test with closure
-      with_translator!(catalog.clone(), || async {
+      let x = with_translator!(catalog.clone(), || async {
         assert_eq!(tr!("Hello"), "Bonjour");
+        tr!("Hello")
       });
+      assert_eq!(x, "Bonjour");
 
       // test with async fn
-      async fn test() {
+      async fn test() -> String {
           assert_eq!(tr!("Hello"), "Bonjour");
+          tr!("Hello")
       };
-      with_translator!(catalog, test());
+      let x = with_translator!(catalog, test());
+      assert_eq!(x, "Bonjour");
 }
 
 }
